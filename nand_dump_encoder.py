@@ -45,6 +45,7 @@ import struct
 import sys
 
 from binascii import unhexlify
+from winbond_w25n01gv_ecc import winbond_compute_sector_ecc, winbond_compute_spare_ecc
 
 #  BCH polynom
 ECC_POLY1 = 0x201b       # 8219
@@ -258,6 +259,127 @@ def atmel_generate_ecc_data(infile, outfile, config, crypto_key):
                   total_sectors, bad_block_count))
 
 
+def winbond_generate_ecc_data(infile, outfile, config):
+    """Generate ECC data and resulting dump file for Winbond W25N01GV.
+    
+    The Winbond W25N01GV uses a Hamming code-based ECC algorithm:
+    - 6 bytes of ECC per 512-byte sector
+    - 2 bytes of spare ECC per spare area (protecting spare[4:14])
+    
+    Spare area layout (16 bytes per sector):
+    - Offset 0-1: Bad block marker (0xFFFF)
+    - Offset 2-3: User Data II (0xFFFF)
+    - Offset 4-7: User Data I (0xFFFFFFFF)
+    - Offset 8-13: Sector ECC (6 bytes, computed)
+    - Offset 14-15: Spare ECC (2 bytes, computed)
+    """
+
+    # open output file
+    fout = open(outfile, "wb")
+
+    # open input file
+    fin = open(infile, "rb")
+
+    # initialize some variables
+    processed_sector_count = 0
+    data_sector_count = 0
+    blank_page_count = 0
+    total_page_count = config['filesize'] // config['pagesize']
+    sectors_per_page = config['pagesize'] // config['sectorsize']
+    total_sectors = total_page_count * sectors_per_page
+
+    # blank page data
+    blank_page = b'\xff' * config['pagesize']
+
+    # spare area layout for Winbond W25N01GV
+    # Each spare area is 16 bytes
+    spare_area_size = config['spareareasize'] // sectors_per_page
+    
+    print("[*] Generating output file ...")
+    for page in range(total_page_count):
+        # read current page data
+        page_data = fin.read(config['pagesize'])
+
+        processed_sector_count += sectors_per_page
+
+        if page_data == blank_page:
+            # increment blank page counter
+            blank_page_count += 1
+
+            # write blank page data and blank spare area data
+            # For blank pages, all spare bytes should be 0xFF
+            full_spare = b'\xff' * config['spareareasize']
+            fout.write(page_data + full_spare)
+
+        else:
+            # increment data sector counter
+            data_sector_count += sectors_per_page
+
+            # generate spare area data for this page
+            full_spare = b''
+            
+            for sector in range(sectors_per_page):
+                # get sector data
+                start_sector = sector * config['sectorsize']
+                end_sector = start_sector + config['sectorsize']
+                sector_data = page_data[start_sector:end_sector]
+
+                # compute sector ECC
+                sector_ecc = winbond_compute_sector_ecc(sector_data)
+                
+                # build spare area for this sector (16 bytes)
+                # Bad block marker (2 bytes)
+                bad_block_marker = b'\xff\xff'
+                # User Data II (2 bytes)
+                user_data_ii = b'\xff\xff'
+                # User Data I (4 bytes)
+                user_data_i = b'\xff\xff\xff\xff'
+                # Sector ECC (6 bytes)
+                # Spare ECC (2 bytes) - computed from spare[4:14]
+                spare_input = user_data_i + sector_ecc
+                spare_ecc = winbond_compute_spare_ecc(spare_input)
+                
+                # Build complete spare area
+                spare_area = bad_block_marker + user_data_ii + user_data_i + sector_ecc + spare_ecc
+                full_spare += spare_area
+
+            # write page data + spare area
+            fout.write(page_data + full_spare)
+
+        # show some statistics during processing all sectors
+        progress = processed_sector_count / total_sectors * 100
+        print("\r    Progress: {:.2f}% ({}/{} sectors)"
+              .format(progress, processed_sector_count, total_sectors), end="")
+
+    # close output file
+    fout.close()
+
+    # close input file
+    fin.close()
+
+    # show some statistics at the end
+    blank_page_percentage = blank_page_count / total_page_count * 100
+    blank_sector_count = blank_page_count * sectors_per_page
+    blank_sector_percentage = blank_sector_count / total_sectors * 100
+    data_sector_percentage = data_sector_count / total_sectors * 100
+    bad_block_count = 0
+
+    print("\n[*] Completed ECC generation process")
+    print("    Successfully written {} bytes of data to output file '{}'"
+          .format(config['filesize'] + config['spareareasize'] * total_page_count, outfile))
+    print("    -----\n    Some statistics\n"
+          "    Total pages:        {}\n"
+          "    Blank pages:        {} ({:.2f}%)\n"
+          "    Blank sectors:      {} ({:.2f}%)\n"
+          "    Data sectors:       {} ({:.2f}%)\n"
+          "    Total sectors:      {}\n"
+          "    Bad blocks:         {}"
+          .format(total_page_count, blank_page_count, blank_page_percentage,
+                  blank_sector_count, blank_sector_percentage,
+                  data_sector_count, data_sector_percentage,
+                  total_sectors, bad_block_count))
+
+
 def show_config(config):
     """Show configuration"""
 
@@ -346,6 +468,7 @@ if __name__ == '__main__':
             configfile.read(args.config)
 
             # convert data types of parsed config data
+            config['mode'] = configfile['default']['Mode']
             config['blocksize'] = int(configfile['default']['blocksize'])
             config['pagesize'] = int(configfile['default']['pagesize'])
             config['sectorsize'] = int(configfile['default']['sectorsize'])
@@ -363,7 +486,7 @@ if __name__ == '__main__':
     # add derivated configuration parameters
     config['fullpagesize'] = config['pagesize'] + config['spareareasize']
 
-    # check crypto key
+    # check crypto key (only used by ATMEL)
     if args.key is not None:
         crypto_key = unhexlify(args.key)
     else:
@@ -374,4 +497,10 @@ if __name__ == '__main__':
     show_config(config)
 
     if config['useecc']:
-        atmel_generate_ecc_data(args.infile, args.outfile, config, crypto_key)
+        # Check mode and call appropriate function
+        mode = config.get('mode', 'ATMEL').upper()
+        if mode == 'WINBOND_W25N01GV':
+            winbond_generate_ecc_data(args.infile, args.outfile, config)
+        else:
+            # Default to ATMEL for backward compatibility
+            atmel_generate_ecc_data(args.infile, args.outfile, config, crypto_key)

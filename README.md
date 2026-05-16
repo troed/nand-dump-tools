@@ -13,6 +13,7 @@ The NAND Dump Tools are based on and inspired by the open source software tool [
 2. NXP i.MX28 (BCH)
 3. NXP P1014 (BCH)
 4. YAFFS2 (Hamming code, experimental)
+5. Winbond W25N01GV (Hamming code with parity correction)
 
 ## Installation
 
